@@ -1,0 +1,20 @@
+# Секреты и данные — не кладём в образ
+.env
+*.db
+data/
+
+# Питон-мусор и окружение
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Гит и IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Прочее
+*.md
+!README.md

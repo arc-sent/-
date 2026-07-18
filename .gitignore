@@ -1,0 +1,17 @@
+# Секреты
+.env
+
+# База данных SQLite
+*.db
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    image: nsigmabot
+    container_name: nsigmabot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # БД лежит в volume, чтобы переживать перезапуски и пересборки.
+      DB_PATH: /data/bot.db
+    volumes:
+      - botdata:/data
+
+volumes:
+  botdata:
