@@ -21,6 +21,15 @@ ADMIN_IDS: set[int] = _parse_ids(os.getenv("ADMIN_IDS", ""))
 DEFAULT_CURRENCY: str = os.getenv("DEFAULT_CURRENCY", "RUB").strip().upper() or "RUB"
 DB_PATH: str = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
 
+# --- TLS / проверка сертификата API ---
+# VERIFY_SSL=false отключает проверку сертификата (крайний случай — например, если
+# перехватывающий прокси/антивирус мешает даже с системным хранилищем).
+VERIFY_SSL: bool = os.getenv("VERIFY_SSL", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# Необязательный путь к своему CA-бандлу (.pem), если нужен конкретный корень.
+CA_BUNDLE: str = os.getenv("CA_BUNDLE", "").strip()
+
 # Какие сервисы показывать и под каким названием — задаётся в catalog.py.
 
 # За сколько единиц указана цена (rate) в API.

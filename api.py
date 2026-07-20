@@ -6,11 +6,43 @@ API-ключ передаётся в каждый вызов (у каждого 
 """
 from __future__ import annotations
 
+import logging
+import ssl
 from typing import Any
 
 import aiohttp
 
 import config
+
+logger = logging.getLogger("prmotion-bot")
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """SSL-контекст для запросов к API.
+
+    Порядок доверия:
+    1. VERIFY_SSL=false — проверка выключена (крайний случай);
+    2. свой CA_BUNDLE, если задан;
+    3. системное хранилище Windows/ОС через ``truststore`` — видит и настоящие CA,
+       и корни перехватывающих антивирусов/прокси;
+    4. запасной вариант — бандл ``certifi``.
+    """
+    if not config.VERIFY_SSL:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        logger.warning("Проверка SSL-сертификата отключена (VERIFY_SSL=false).")
+        return ctx
+    if config.CA_BUNDLE:
+        return ssl.create_default_context(cafile=config.CA_BUNDLE)
+    try:
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
 
 
 class ApiError(Exception):
@@ -21,11 +53,15 @@ class PrmotionAPI:
     def __init__(self, api_url: str = config.API_URL):
         self._url = api_url
         self._session: aiohttp.ClientSession | None = None
+        self._ssl: ssl.SSLContext | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            if self._ssl is None:
+                self._ssl = _build_ssl_context()
             timeout = aiohttp.ClientTimeout(total=30)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            connector = aiohttp.TCPConnector(ssl=self._ssl)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     async def close(self) -> None:
