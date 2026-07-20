@@ -35,6 +35,7 @@ DRIP_DAYS_BY_GROUP: dict[str, tuple[int, ...]] = {
 }
 DRIP_RUNS_PER_DAY: int = 6                    # сколько докруток в сутки (равномерно)
 DRIP_TICK_SECONDS: int = 45                   # период проверки планировщика
+DRIP_MAX_CONCURRENT: int = 10                 # максимум одновременно выполняющихся докруток
 
 
 def drip_days_for(group: str | None) -> tuple[int, ...]:

@@ -33,6 +33,7 @@ async def init() -> None:
             batch_id     TEXT NOT NULL,
             telegram_id  INTEGER NOT NULL,
             service      INTEGER NOT NULL,
+            link         TEXT NOT NULL DEFAULT '',
             params_json  TEXT NOT NULL,
             quantity     INTEGER NOT NULL,
             currency     TEXT NOT NULL,
@@ -44,8 +45,23 @@ async def init() -> None:
         )
         """
     )
+    # Миграция старой БД: колонка link появилась позже.
+    async with _db.execute("PRAGMA table_info(drip_runs)") as cur:
+        cols = [r["name"] for r in await cur.fetchall()]
+    if "link" not in cols:
+        await _db.execute(
+            "ALTER TABLE drip_runs ADD COLUMN link TEXT NOT NULL DEFAULT ''"
+        )
     await _db.execute(
         "CREATE INDEX IF NOT EXISTS idx_drip_due ON drip_runs (status, run_at)"
+    )
+    await _db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_drip_link ON drip_runs (link, status)"
+    )
+    # Докрутки, зависшие в 'processing' после падения/рестарта, возвращаем в очередь:
+    # при старте ничего реально «в полёте» нет.
+    await _db.execute(
+        "UPDATE drip_runs SET status = 'pending' WHERE status = 'processing'"
     )
     await _db.commit()
 
@@ -105,32 +121,88 @@ async def delete_user(telegram_id: int) -> None:
 # ---------- Капельная доставка (drip-feed) ----------
 
 async def add_drip_runs(runs: list[dict[str, Any]]) -> None:
-    """runs: список словарей с ключами batch_id, telegram_id, service, params_json,
-    quantity, currency, run_at."""
+    """runs: список словарей с ключами batch_id, telegram_id, service, link,
+    params_json, quantity, currency, run_at."""
     now = int(time.time())
     await _conn().executemany(
         """
         INSERT INTO drip_runs
-            (batch_id, telegram_id, service, params_json, quantity, currency, run_at, created_at)
-        VALUES (:batch_id, :telegram_id, :service, :params_json, :quantity, :currency, :run_at, :created_at)
+            (batch_id, telegram_id, service, link, params_json, quantity, currency, run_at, created_at)
+        VALUES (:batch_id, :telegram_id, :service, :link, :params_json, :quantity, :currency, :run_at, :created_at)
         """,
         [{**r, "created_at": now} for r in runs],
     )
     await _conn().commit()
 
 
-async def due_drip_runs(now_ts: int, limit: int = 50) -> list[dict[str, Any]]:
-    async with _conn().execute(
+async def claim_due_drip_runs(now_ts: int, max_concurrent: int) -> list[dict[str, Any]]:
+    """Забирает наступившие докрутки в работу, помечая их 'processing'.
+
+    Правила:
+    * не больше ``max_concurrent`` докруток в статусе 'processing' одновременно;
+    * на один ролик (link) активна только одна партия (batch) — та, что стартовала
+      раньше; докрутки более поздних партий на тот же ролик ждут её завершения.
+
+    Пометка 'processing' атомарна (UPDATE ... WHERE status='pending'), поэтому одна
+    и та же докрутка не будет отправлена дважды.
+    """
+    conn = _conn()
+
+    # Сколько докруток уже «в полёте».
+    async with conn.execute(
+        "SELECT COUNT(*) AS c FROM drip_runs WHERE status = 'processing'"
+    ) as cur:
+        row = await cur.fetchone()
+    slots = max_concurrent - (int(row["c"]) if row else 0)
+    if slots <= 0:
+        return []
+
+    # Активная партия для каждого ролика = стартовавшая раньше всех среди незавершённых.
+    async with conn.execute(
+        """
+        SELECT link, batch_id, MIN(run_at) AS start_at
+        FROM drip_runs
+        WHERE status IN ('pending', 'processing')
+        GROUP BY link, batch_id
+        """
+    ) as cur:
+        groups = [dict(r) for r in await cur.fetchall()]
+    active_batch: dict[str, str] = {}
+    active_start: dict[str, int] = {}
+    for g in groups:
+        link = g["link"]
+        key = (g["start_at"], g["batch_id"])  # тай-брейк по batch_id для стабильности
+        if link not in active_start or key < (active_start[link], active_batch[link]):
+            active_start[link] = g["start_at"]
+            active_batch[link] = g["batch_id"]
+
+    # Наступившие докрутки, самые ранние первыми.
+    async with conn.execute(
         """
         SELECT * FROM drip_runs
         WHERE status = 'pending' AND run_at <= ?
         ORDER BY run_at ASC
-        LIMIT ?
         """,
-        (now_ts, limit),
+        (now_ts,),
     ) as cur:
-        rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+        candidates = [dict(r) for r in await cur.fetchall()]
+
+    claimed: list[dict[str, Any]] = []
+    for run in candidates:
+        if len(claimed) >= slots:
+            break
+        # Только докрутки активной партии этого ролика.
+        if active_batch.get(run["link"]) != run["batch_id"]:
+            continue
+        upd = await conn.execute(
+            "UPDATE drip_runs SET status = 'processing' WHERE id = ? AND status = 'pending'",
+            (run["id"],),
+        )
+        if upd.rowcount == 1:
+            run["status"] = "processing"
+            claimed.append(run)
+    await conn.commit()
+    return claimed
 
 
 async def mark_drip_done(run_id: int, api_order_id: str) -> None:
@@ -155,6 +227,7 @@ async def drip_batch_stats(batch_id: str) -> dict[str, Any]:
         SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
             SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
             SUM(quantity) AS quantity
@@ -172,12 +245,13 @@ async def active_drip_batches(telegram_id: int) -> list[dict[str, Any]]:
         SELECT batch_id, service, currency,
                COUNT(*) AS total,
                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+               SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
                SUM(quantity) AS quantity,
                MIN(run_at) AS first_at, MAX(run_at) AS last_at
         FROM drip_runs
         WHERE telegram_id = ?
         GROUP BY batch_id
-        HAVING pending > 0
+        HAVING (pending + processing) > 0
         ORDER BY last_at ASC
         """,
         (telegram_id,),

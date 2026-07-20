@@ -48,6 +48,26 @@ def services_back() -> InlineKeyboardMarkup:
     )
 
 
+def order_categories(groups: list[tuple[str, str, int]]) -> InlineKeyboardMarkup:
+    """Категории для выбора при создании заказа. groups: (key, label, count)."""
+    rows = [
+        [InlineKeyboardButton(text=f"{label} · {count}", callback_data=f"ord:cat:{key}")]
+        for key, label, count in groups
+        if count > 0
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def order_services(items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Сервисы внутри категории. items: (service_id, button_label)."""
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"ord:svc:{sid}")]
+        for sid, label in items
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ К категориям", callback_data="ord:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def delivery_options(days_choices: tuple[int, ...]) -> InlineKeyboardMarkup:
     row = [InlineKeyboardButton(text="⚡ Сразу", callback_data="drip:0")]
     for d in days_choices:

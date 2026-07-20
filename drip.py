@@ -15,19 +15,74 @@ import config
 DAY_SECONDS = 86400
 
 
-def _split_counts(total: int, days: int, service_min: int, runs_per_day: int | None) -> list[int]:
-    """Размеры частей: равные, не меньше service_min, сумма = total."""
+def _cap_redistribute(counts: list[int], cap: int) -> None:
+    """Срезает всё, что выше cap, и раскидывает излишек по порциям, где есть место."""
+    overflow = 0
+    for i, c in enumerate(counts):
+        if c > cap:
+            overflow += c - cap
+            counts[i] = cap
+    n = len(counts)
+    i = 0
+    guard = 0
+    while overflow > 0 and guard < overflow + 4 * n + 16:
+        room = cap - counts[i % n]
+        if room > 0:
+            add = min(room, overflow)
+            counts[i % n] += add
+            overflow -= add
+        i += 1
+        guard += 1
+
+
+def _split_counts(
+    total: int,
+    days: int,
+    service_min: int,
+    runs_per_day: int | None,
+    service_max: int | None = None,
+) -> list[int]:
+    """Размеры частей: РАЗНЫЕ («рваные»), не меньше service_min, сумма = total.
+
+    Чтобы график выглядел живым, порции не равные, а случайного размера: у одних
+    докруток объём заметно больше, у других меньше (напр. 455, 102, 577…). Каждая
+    порция ≥ service_min и (если задан) ≤ service_max — лимит одного заказа в API.
+    """
     total = int(total)
     min_chunk = max(1, int(service_min or 1))
     per_day = int(runs_per_day or config.DRIP_RUNS_PER_DAY)
 
     n = max(1, days * per_day)
+    # Не больше, чем позволяет минимум порции.
     if total // n < min_chunk:
         n = max(1, total // min_chunk)
+    # Если задан максимум — порций должно хватить, чтобы каждая влезла в лимит.
+    cap = int(service_max) if service_max else 0
+    if cap >= min_chunk and cap > 0:
+        n = max(n, -(-total // cap))  # ceil(total / cap)
+        n = min(n, max(1, total // min_chunk))
 
-    base = total // n
-    rem = total - base * n
-    return [base + (1 if i < rem else 0) for i in range(n)]
+    if n <= 1:
+        return [total]
+
+    # Каждой порции гарантируем min_chunk, остаток раскидываем по случайным весам
+    # с тяжёлым хвостом — отсюда заметный «рваный» разброс размеров.
+    counts = [min_chunk] * n
+    remaining = total - min_chunk * n
+    if remaining > 0:
+        weights = [random.expovariate(1.0) for _ in range(n)]
+        wsum = sum(weights) or 1.0
+        extra = [int(remaining * w / wsum) for w in weights]
+        # Остаток от округления добираем по одной единице.
+        for i in range(remaining - sum(extra)):
+            extra[i % n] += 1
+        counts = [c + e for c, e in zip(counts, extra)]
+
+    if cap >= min_chunk and cap > 0:
+        _cap_redistribute(counts, cap)
+
+    random.shuffle(counts)
+    return counts
 
 
 def _per_day_counts(n: int, days: int) -> list[int]:
@@ -91,10 +146,16 @@ def _active_offsets(n: int, days: int, now_ts: int, jitter: int) -> list[int]:
     return [max(0, int(t.timestamp() - now_ts)) for t in times]
 
 
-def plan(total: int, days: int, service_min: int, now_ts: int) -> list[tuple[int, int]]:
+def plan(
+    total: int,
+    days: int,
+    service_min: int,
+    now_ts: int,
+    service_max: int | None = None,
+) -> list[tuple[int, int]]:
     """Список (offset_seconds, quantity) — когда и сколько докрутить."""
     days = max(1, int(days))
-    chunks = _split_counts(total, days, service_min, config.DRIP_RUNS_PER_DAY)
+    chunks = _split_counts(total, days, service_min, config.DRIP_RUNS_PER_DAY, service_max)
     n = len(chunks)
     jitter = max(0, int(config.DRIP_JITTER_MINUTES)) * 60
     if config.DRIP_ACTIVE_HOURS:
@@ -110,8 +171,8 @@ def summarize(schedule: list[tuple[int, int]], days: int) -> str:
     n = len(schedule)
     if n <= 1:
         return "1 доставка"
-    sizes = {q for _, q in schedule}
-    per = f"по {next(iter(sizes))}" if len(sizes) == 1 else f"по ~{schedule[0][1]}"
+    qtys = [q for _, q in schedule]
+    per = f"рваными порциями от {min(qtys)} до {max(qtys)}"
     tail = ""
     if config.DRIP_ACTIVE_HOURS:
         s, e = config.DRIP_ACTIVE_HOURS

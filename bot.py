@@ -53,7 +53,6 @@ class RegStates(StatesGroup):
 
 
 class OrderStates(StatesGroup):
-    service_id = State()
     collecting = State()
     delivery = State()
     confirm = State()
@@ -171,6 +170,14 @@ def fmt_service(s: dict[str, Any]) -> str:
         f"🔹 <b>{s.get('service')}</b> — {name}\n"
         f"    💵 {price_str} · min {s.get('min')} / max {s.get('max')}"
     )
+
+
+def _service_button_label(s: dict[str, Any]) -> str:
+    """Короткая подпись кнопки: название + цена за штуку."""
+    name = catalog.name_of(s.get("service"), str(s.get("name", "—")))
+    price = unit_price(s)
+    label = f"{name} · {_fmt_amount(price)}₽" if price is not None else name
+    return label[:64]  # ограничение Telegram на текст кнопки
 
 
 def fmt_status(order_id: str, st: dict[str, Any]) -> str:
@@ -342,52 +349,100 @@ async def services_category(call: CallbackQuery, api_key: str) -> None:
 
 # ---------- Создание заказа ----------
 
+_ORDER_CATEGORIES_TEXT = "🛒 <b>Создание заказа</b>\nВыбери категорию:"
+
+
 @router.message(F.text == kb.BTN_ORDER)
 @router.message(Command("order"))
-async def order_start(message: Message, state: FSMContext) -> None:
+async def order_start(message: Message, state: FSMContext, api_key: str) -> None:
     await state.clear()
-    await state.set_state(OrderStates.service_id)
-    await message.answer(
-        "🛒 Создание заказа.\n"
-        "Пришли <b>ID сервиса</b> (посмотреть можно в «📋 Сервисы»).",
-        reply_markup=kb.cancel_menu(),
-    )
-
-
-@router.message(OrderStates.service_id)
-async def order_service_id(message: Message, state: FSMContext, api_key: str) -> None:
-    service_id = (message.text or "").strip()
-    if not service_id.isdigit():
-        await message.answer("ID сервиса — это число. Попробуй ещё раз.")
-        return
     try:
         services = await get_services(api_key)
     except ApiError as exc:
         await message.answer(f"⚠️ Ошибка: {html.escape(str(exc))}")
         return
+    if not services:
+        await message.answer("Сервисы сейчас недоступны. Попробуй позже.")
+        return
+    _, rows = _categories_view(services)
+    await message.answer(_ORDER_CATEGORIES_TEXT, reply_markup=kb.order_categories(rows))
+
+
+@router.callback_query(F.data == "ord:back")
+async def order_pick_back(call: CallbackQuery, api_key: str) -> None:
+    try:
+        services = await get_services(api_key)
+    except ApiError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    _, rows = _categories_view(services)
+    await call.message.edit_text(_ORDER_CATEGORIES_TEXT, reply_markup=kb.order_categories(rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ord:cat:"))
+async def order_pick_category(call: CallbackQuery, api_key: str) -> None:
+    group_key = call.data.split(":", 2)[2]
+    try:
+        services = await get_services(api_key)
+    except ApiError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    items = group_services(services).get(group_key, [])
+    label = grp.GROUP_LABELS.get(group_key, group_key)
+    if not items:
+        await call.answer("В этой категории пока нет сервисов.", show_alert=True)
+        return
+    btns = [(str(s.get("service")), _service_button_label(s)) for s in items]
+    await call.message.edit_text(
+        f"{label}\nВыбери сервис:",
+        reply_markup=kb.order_services(btns),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ord:svc:"))
+async def order_pick_service(call: CallbackQuery, state: FSMContext, api_key: str) -> None:
+    service_id = call.data.split(":", 2)[2]
+    try:
+        services = await get_services(api_key)
+    except ApiError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
     service = find_service(services, service_id)
     if service is None:
-        await message.answer("VK-сервис с таким ID не найден. Проверь список «📋 Сервисы».")
+        await call.answer("Сервис не найден — обнови список и попробуй снова.", show_alert=True)
         return
 
     fields = fields_for(str(service.get("type", "Default")))
+    await state.set_state(OrderStates.collecting)
     await state.update_data(
         service=service,
         params={},
         field_index=0,
         currency=config.DEFAULT_CURRENCY,
     )
-    await message.answer(f"Выбран сервис:\n{fmt_service(service)}")
-    await _ask_next_field(message, state, fields, 0)
+    await call.message.edit_text(f"✅ Выбран сервис:\n{fmt_service(service)}")
+    await call.answer()
+    await _ask_next_field(call.message, state, fields, 0, with_cancel=True)
 
 
-async def _ask_next_field(message: Message, state: FSMContext, fields: list[Field], index: int) -> None:
+async def _ask_next_field(
+    message: Message,
+    state: FSMContext,
+    fields: list[Field],
+    index: int,
+    with_cancel: bool = False,
+) -> None:
     if index >= len(fields):
         await _finish_collecting(message, state)
         return
     field = fields[index]
     await state.set_state(OrderStates.collecting)
-    await message.answer(f"✏️ <b>{field.label}</b>\n{field.hint}")
+    await message.answer(
+        f"✏️ <b>{field.label}</b>\n{field.hint}",
+        reply_markup=kb.cancel_menu() if with_cancel else None,
+    )
 
 
 def _is_drippable(params: dict[str, Any]) -> bool:
@@ -493,12 +548,15 @@ def _build_schedule(service: dict[str, Any], params: dict[str, Any], drip_days: 
     if drip_days <= 0 or not _is_drippable(params):
         return []
     total = int(params["quantity"])
-    service_min = service.get("min")
     try:
-        service_min = int(service_min)
+        service_min = int(service.get("min"))
     except (TypeError, ValueError):
         service_min = 1
-    return drip.plan(total, drip_days, service_min, int(time.time()))
+    try:
+        service_max = int(service.get("max"))
+    except (TypeError, ValueError):
+        service_max = None
+    return drip.plan(total, drip_days, service_min, int(time.time()), service_max)
 
 
 async def _show_summary(message: Message, state: FSMContext) -> None:
@@ -590,6 +648,9 @@ async def _create_drip(
     drip_days: int,
 ) -> None:
     batch_id = uuid.uuid4().hex[:12]
+    # Ключ ролика для сериализации. Если ссылки нет — привязываемся к самой партии,
+    # чтобы разные заказы без ссылки не блокировали друг друга.
+    link = str(params.get("link") or params.get("username") or "").strip() or batch_id
     now = int(time.time())
     runs = []
     for offset, chunk in schedule:
@@ -598,6 +659,7 @@ async def _create_drip(
             "batch_id": batch_id,
             "telegram_id": call.from_user.id,
             "service": int(service.get("service")),
+            "link": link,
             "params_json": json.dumps(run_params, ensure_ascii=False),
             "quantity": int(chunk),
             "currency": currency,
@@ -679,7 +741,7 @@ async def cmd_drips(message: Message) -> None:
     now = int(time.time())
     lines = ["💧 <b>Активные капельные доставки:</b>"]
     for b in batches:
-        done = b["total"] - b["pending"]
+        done = b["total"] - (b["pending"] or 0) - (b.get("processing") or 0)
         left_h = max(0, round((b["last_at"] - now) / 3600, 1))
         name = catalog.name_of(b["service"], f"сервис {b['service']}")
         lines.append(
@@ -720,7 +782,7 @@ async def _process_drip_run(bot: Bot, run: dict[str, Any]) -> None:
 
     # Если это была последняя докрутка партии — отчитаемся.
     stats = await db.drip_batch_stats(run["batch_id"])
-    if stats and stats.get("pending", 0) == 0:
+    if stats and (stats.get("pending", 0) or 0) == 0 and (stats.get("processing", 0) or 0) == 0:
         done = stats.get("done", 0)
         failed = stats.get("failed", 0)
         text = (
@@ -740,9 +802,16 @@ async def drip_scheduler(bot: Bot) -> None:
     logger.info("Планировщик капельной доставки запущен")
     while True:
         try:
-            due = await db.due_drip_runs(int(time.time()))
-            for run in due:
-                await _process_drip_run(bot, run)
+            claimed = await db.claim_due_drip_runs(
+                int(time.time()), config.DRIP_MAX_CONCURRENT
+            )
+            if claimed:
+                # Захваченные докрутки уже помечены 'processing' и их не больше лимита —
+                # отправляем параллельно. return_exceptions, чтобы один сбой не отменял остальные.
+                await asyncio.gather(
+                    *(_process_drip_run(bot, run) for run in claimed),
+                    return_exceptions=True,
+                )
         except Exception:  # noqa: BLE001 — цикл не должен падать
             logger.exception("Ошибка в планировщике капельной доставки")
         await asyncio.sleep(config.DRIP_TICK_SECONDS)
